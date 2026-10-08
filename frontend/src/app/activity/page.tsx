@@ -2,11 +2,13 @@
 
 import { ChevronRight } from "lucide-react";
 import { useEffect, useState } from "react";
+import { AuditLog } from "@/components/AuditLog";
 import { RunBlock, fmtCost } from "@/components/RunBlock";
 import { useApp } from "@/components/Shell";
 import { api } from "@/lib/api";
 import { runFromRecord } from "@/lib/runview";
 import type { RunRecord, RunView } from "@/lib/types";
+import { useUrlParam } from "@/lib/useUrlParam";
 
 const STATUS_STYLE: Record<string, string> = {
   completed: "text-ok border-ok/30",
@@ -68,8 +70,16 @@ function RunRow({ run }: { run: RunRecord }) {
   );
 }
 
+type Tab = "runs" | "audit";
+const TABS: { id: Tab; label: string }[] = [
+  { id: "runs", label: "Runs" },
+  { id: "audit", label: "Audit log" },
+];
+
 export default function ActivityPage() {
   const { config } = useApp();
+  const [tabParam, setTab] = useUrlParam("tab");
+  const tab: Tab = tabParam === "audit" ? "audit" : "runs"; // the URL can say anything; fall back to the default
   const [runs, setRuns] = useState<RunRecord[] | null>(null);
 
   useEffect(() => {
@@ -83,24 +93,49 @@ export default function ActivityPage() {
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-4xl space-y-6 px-4 py-6">
         <h1 className="text-xl font-semibold">Activity</h1>
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-          <Stat label="Spent this month" value={config ? `$${config.budget.spent_usd.toFixed(2)}` : "—"} />
-          <Stat label="Monthly budget" value={config ? `$${config.budget.monthly_usd.toFixed(0)}` : "—"} />
-          <Stat label="Runs (last 100)" value={runs ? String(runs.length) : "—"} />
-          <Stat
-            label="Avg cost / run"
-            value={runs && runs.length ? fmtCost(totalCost / runs.length) : "—"}
-          />
+        <div role="tablist" aria-label="Activity views" className="flex gap-1 border-b border-line">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              role="tab"
+              id={`activity-tab-${t.id}`}
+              aria-selected={tab === t.id}
+              aria-controls="activity-panel"
+              onClick={() => setTab(t.id === "runs" ? null : t.id, "replace")}
+              className={`-mb-px border-b-2 px-3 py-2 text-sm ${
+                tab === t.id ? "border-accent text-fg" : "border-transparent text-muted hover:text-fg"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
-        {runs && runs.length > 0 && (
-          <p className="text-xs text-muted">
-            {done} of {runs.length} completed. Expand a run to replay every thought, tool call and result.
-          </p>
-        )}
-        <div className="space-y-2">
-          {runs === null && <p className="text-sm text-muted">Loading…</p>}
-          {runs?.length === 0 && <p className="text-sm text-muted">No runs yet — ask the agent something in Chat.</p>}
-          {runs?.map((r) => <RunRow key={r.id} run={r} />)}
+        <div role="tabpanel" id="activity-panel" aria-labelledby={`activity-tab-${tab}`} className="space-y-6">
+          {tab === "audit" ? (
+            <AuditLog />
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                <Stat label="Spent this month" value={config ? `$${config.budget.spent_usd.toFixed(2)}` : "—"} />
+                <Stat label="Monthly budget" value={config ? `$${config.budget.monthly_usd.toFixed(0)}` : "—"} />
+                <Stat label="Runs (last 100)" value={runs ? String(runs.length) : "—"} />
+                <Stat
+                  label="Avg cost / run"
+                  value={runs && runs.length ? fmtCost(totalCost / runs.length) : "—"}
+                />
+              </div>
+              {runs && runs.length > 0 && (
+                <p className="text-xs text-muted">
+                  {done} of {runs.length} completed. Expand a run to replay every thought, tool call and result.
+                </p>
+              )}
+              <div className="space-y-2">
+                {runs === null && <p className="text-sm text-muted">Loading…</p>}
+                {runs?.length === 0 && <p className="text-sm text-muted">No runs yet — ask the agent something in Chat.</p>}
+                {runs?.map((r) => <RunRow key={r.id} run={r} />)}
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

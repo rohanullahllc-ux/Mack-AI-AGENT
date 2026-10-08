@@ -12,9 +12,9 @@ from pydantic import BaseModel, Field
 
 from app.agent.loop import AgentRunner
 from app.config import SINGLE_USER_ID, Settings, get_settings
-from app.db import Database
+from app.db import AuditOutcome, Database
 from app.runs import RunManager, RunRejected
-from app.tools.registry import load_builtin_tools
+from app.tools.registry import Tier, load_builtin_tools
 
 log = logging.getLogger("agent")
 
@@ -40,6 +40,9 @@ def create_app(settings: Settings | None = None, client: Any = None) -> FastAPI:
         orphaned = db.fail_orphaned_runs()
         if orphaned:
             log.warning("closed %d orphaned run(s) from a previous crash", orphaned)
+        unanswered = db.fail_orphaned_approvals()
+        if unanswered:
+            log.warning("closed %d approval request(s) left unanswered by a previous crash", unanswered)
         app.state.db = db
         app.state.runs = RunManager(settings, db, AgentRunner(settings, db, registry, client))
         yield
@@ -193,6 +196,22 @@ def create_app(settings: Settings | None = None, client: Any = None) -> FastAPI:
         if not runs_of(request).decide(run_id, tool_use_id, body.approved):
             raise HTTPException(409, "No pending approval for that action (already decided, or it timed out).")
         return {"decided": True}
+
+    @app.get("/api/audit")
+    async def audit_log(
+        request: Request,
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0),
+        outcome: AuditOutcome | None = None,
+        tool: str | None = Query(None, max_length=100),
+        tier: Tier | None = None,
+        run_id: str | None = Query(None, max_length=64),
+        user: str = Depends(require_user),
+    ) -> dict[str, Any]:
+        """Who allowed what, newest first. Outlives the chats it came from; there is deliberately no delete."""
+        return db_of(request).list_audit(
+            user, limit=limit, offset=offset, outcome=outcome, tool=tool, tier=tier, run_id=run_id
+        )
 
     return app
 

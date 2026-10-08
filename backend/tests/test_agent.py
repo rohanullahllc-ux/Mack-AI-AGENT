@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import json
+
+import pytest
+
 from app.agent.loop import AgentRunner, ApprovalDecision, RunStats
 from app.agent.pricing import estimate_cost
 from app.config import SINGLE_USER_ID
@@ -270,6 +275,127 @@ async def test_parallel_writes_each_get_their_own_approval(settings):
     assert stats.status == "completed"
     assert sorted(a[0] for a in approver.asked) == ["a", "b"]
     assert [b["tool_use_id"] for b in db.get_messages(conv["id"], SINGLE_USER_ID)[2]["content"]] == ["a", "b"]
+
+
+# ---- audit trail ------------------------------------------------------------
+
+WRITE_SCRIPT = lambda: [  # noqa: E731
+    make_message([tool_use("t1", "write_note", title="Todo", content="milk")], "tool_use"),
+    make_message([text("done")]),
+]
+
+
+def audit_rows(db):
+    return db.list_audit(SINGLE_USER_ID)["items"]
+
+
+async def test_approved_write_is_audited_with_its_result(settings):
+    db, *_ = await run_once(settings, WRITE_SCRIPT(), approve=Approver(True))
+    (row,) = audit_rows(db)
+    assert (row["tool"], row["tier"], row["outcome"], row["result"]) == ("write_note", "write", "approved", "ok")
+    assert (row["run_id"], row["tool_use_id"]) == ("run1", "t1")
+    assert json.loads(row["input_preview"]) == {"title": "Todo", "content": "milk"}
+    assert row["decided_at"] >= row["requested_at"]
+
+
+async def test_denied_write_is_audited_and_has_no_result(settings):
+    db, *_ = await run_once(settings, WRITE_SCRIPT(), approve=Approver(False, "the user denied this action"))
+    (row,) = audit_rows(db)
+    assert (row["outcome"], row["reason"], row["result"]) == ("denied", "the user denied this action", None)
+
+
+async def test_unanswered_request_is_audited_as_timed_out(settings):
+    approver = Approver()
+    approver.decision = ApprovalDecision(False, "no response within 300s", timed_out=True)
+    db, *_ = await run_once(settings, WRITE_SCRIPT(), approve=approver)
+    (row,) = audit_rows(db)
+    assert (row["outcome"], row["result"]) == ("timed_out", None) and "no response" in row["reason"]
+
+
+async def test_no_approval_channel_is_audited_as_a_denial(settings):
+    db, *_ = await run_once(settings, WRITE_SCRIPT(), approve=None)
+    (row,) = audit_rows(db)
+    assert row["outcome"] == "denied" and "no approval channel" in row["reason"] and row["result"] is None
+
+
+async def test_write_the_policy_lets_through_is_still_audited(settings):
+    settings.approval_level = "never"
+    approver = Approver(False)
+    db, *_ = await run_once(settings, WRITE_SCRIPT(), approve=approver)
+    assert approver.asked == []  # nobody was asked...
+    (row,) = audit_rows(db)  # ...but it still changed state, so it is on the record
+    assert (row["outcome"], row["result"]) == ("auto", "ok")
+
+
+async def test_approved_call_that_fails_is_audited_as_an_error(settings):
+    script = [
+        make_message([tool_use("t1", "write_note", title="Big", content="x" * 100_001)], "tool_use"),
+        make_message([text("too big")]),
+    ]
+    db, *_ = await run_once(settings, script, approve=Approver(True))
+    (row,) = audit_rows(db)
+    assert (row["outcome"], row["result"]) == ("approved", "error")  # allowed, but it did not take effect
+
+
+async def test_reads_and_malformed_calls_are_not_audited(settings):
+    read = [make_message([tool_use("t1", "get_current_time")], "tool_use"), make_message([text("ok")])]
+    db, *_ = await run_once(settings, read)
+    assert audit_rows(db) == []
+
+    malformed = [make_message([tool_use("t1", "write_note", title="x")], "tool_use"), make_message([text("ok")])]
+    db, *_ = await run_once(settings, malformed)  # `content` is missing: nothing was asked, nothing ran
+    assert audit_rows(db) == []
+
+
+def runner_for(settings, script):
+    db = Database(":memory:")
+    conv = db.create_conversation(SINGLE_USER_ID)
+    return db, conv, AgentRunner(settings, db, REGISTRY, FakeClient(script))
+
+
+async def test_cancelled_while_waiting_closes_the_audit_row(settings):
+    async def cancelled_by_user(*_):
+        raise asyncio.CancelledError
+
+    db, conv, runner = runner_for(settings, WRITE_SCRIPT())
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(
+            conversation_id=conv["id"], user_id=SINGLE_USER_ID, run_id="run1", user_text="hi",
+            emit=Collector(), approve=cancelled_by_user,
+        )
+    (row,) = audit_rows(db)
+    assert (row["outcome"], row["result"]) == ("cancelled", None) and row["decided_at"] is not None
+    assert not list(settings.data_dir.rglob("*.md"))  # it was never run
+
+
+async def test_cancelled_mid_run_is_audited_as_interrupted(settings, monkeypatch):
+    async def cancelled_mid_flight(*_):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(REGISTRY, "execute", cancelled_mid_flight)
+    db, conv, runner = runner_for(settings, WRITE_SCRIPT())
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(
+            conversation_id=conv["id"], user_id=SINGLE_USER_ID, run_id="run1", user_text="hi",
+            emit=Collector(), approve=Approver(True),
+        )
+    (row,) = audit_rows(db)
+    assert (row["outcome"], row["result"]) == ("approved", "interrupted")  # allowed, but whether it landed is unknown
+
+
+async def test_parallel_writes_are_audited_one_row_each(settings):
+    script = [
+        make_message(
+            [tool_use("a", "write_note", title="one", content="1"), tool_use("b", "write_note", title="two", content="2")],
+            "tool_use",
+        ),
+        make_message([text("done")]),
+    ]
+    db, *_ = await run_once(settings, script, approve=Approver(True))
+    assert sorted((r["tool_use_id"], r["outcome"], r["result"]) for r in audit_rows(db)) == [
+        ("a", "approved", "ok"),
+        ("b", "approved", "ok"),
+    ]
 
 
 # ---- cost survives failure --------------------------------------------------

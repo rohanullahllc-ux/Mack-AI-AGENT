@@ -2,7 +2,7 @@
 
 import { AlertTriangle, Ban, Brain, Check, ChevronRight, Globe, Info, Loader2, ShieldAlert, Wrench, X } from "lucide-react";
 import { useState } from "react";
-import type { RunView, Step } from "@/lib/types";
+import type { ApprovalInfo, RunView, Step } from "@/lib/types";
 import { Markdown } from "./Markdown";
 
 const TIER_STYLE: Record<string, string> = {
@@ -19,11 +19,34 @@ export type DecideFn = (toolUseId: string, approved: boolean) => Promise<void>;
 
 const fmtTimeout = (s: number) => (s >= 60 ? `${Math.round(s / 60)} min` : `${Math.round(s)} s`);
 
-function TierBadge({ tier }: { tier: string }) {
+export function TierBadge({ tier }: { tier: string }) {
   return (
     <span className={`rounded-full border px-1.5 text-[10px] uppercase ${TIER_STYLE[tier] ?? "text-muted border-line"}`}>
       {tier}
     </span>
+  );
+}
+
+const APPROVAL_LABEL: Record<ApprovalInfo["outcome"], string> = {
+  approved: "Approved",
+  denied: "Denied",
+  timed_out: "Timed out",
+  cancelled: "Cancelled",
+};
+
+/** How the approval request for this call ended, and when (the time is only known for replayed runs). */
+function ApprovalNote({ approval }: { approval: ApprovalInfo }) {
+  return (
+    <div>
+      <div className="mb-1 text-muted">Approval</div>
+      <div>
+        <span className={approval.outcome === "approved" ? "text-ok" : "text-warn"}>
+          {APPROVAL_LABEL[approval.outcome] ?? approval.outcome}
+        </span>
+        {approval.ts !== undefined && <span className="text-muted"> · {new Date(approval.ts * 1000).toLocaleTimeString()}</span>}
+        {approval.outcome !== "approved" && approval.reason && <span className="text-muted"> — {approval.reason}</span>}
+      </div>
+    </div>
   );
 }
 
@@ -115,6 +138,7 @@ function ToolStep({ step, onDecide }: { step: ToolStepData; onDecide?: DecideFn 
         {status}
       </summary>
       <div className="space-y-2 border-t border-line px-3 py-2 text-xs">
+        {step.approval && <ApprovalNote approval={step.approval} />}
         <div>
           <div className="mb-1 text-muted">Input</div>
           <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono">

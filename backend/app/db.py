@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -70,7 +70,30 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_user ON usage_ledger(user_id, created_at);
+
+-- Who allowed what: one row per state-changing tool call. Like the ledger, deliberately NOT linked to
+-- runs/conversations by a foreign key: deleting a chat must not erase the record that an action was allowed.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    tool_use_id TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    input_preview TEXT NOT NULL,    -- compact JSON of the call's input, capped (the full input lives in the run replay)
+    outcome TEXT NOT NULL,          -- pending | auto | approved | denied | timed_out | cancelled
+    reason TEXT NOT NULL DEFAULT '',
+    result TEXT,                    -- ok | error | interrupted; NULL when the tool never ran
+    requested_at REAL NOT NULL,
+    decided_at REAL                 -- NULL while still pending
+);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_run ON audit_log(run_id);
 """
+
+# pending = waiting for the user; auto = approval policy let it run without asking
+AuditOutcome = Literal["pending", "auto", "approved", "denied", "timed_out", "cancelled"]
+INPUT_PREVIEW_CHARS = 2000
 
 
 def new_id() -> str:
@@ -266,6 +289,89 @@ class Database:
 
     def get_events(self, run_id: str, after: int = -1) -> list[dict[str, Any]]:
         rows = self._all(
-            "SELECT seq, type, data FROM run_events WHERE run_id=? AND seq>? ORDER BY seq", (run_id, after)
+            "SELECT seq, type, data, created_at FROM run_events WHERE run_id=? AND seq>? ORDER BY seq",
+            (run_id, after),
         )
-        return [{"seq": r["seq"], "type": r["type"], "data": json.loads(r["data"])} for r in rows]
+        return [
+            {"seq": r["seq"], "type": r["type"], "data": json.loads(r["data"]), "ts": r["created_at"]}
+            for r in rows
+        ]
+
+    # -- audit log -------------------------------------------------------
+    def audit_open(
+        self,
+        *,
+        user_id: str,
+        run_id: str,
+        tool_use_id: str,
+        tool: str,
+        tier: str,
+        tool_input: Any,
+        outcome: AuditOutcome,
+    ) -> int:
+        """Record a state-changing call as it is considered: 'pending' while the user decides, or 'auto'
+        when the approval policy lets it run without asking."""
+        preview = json.dumps(tool_input, ensure_ascii=False, default=str)
+        if len(preview) > INPUT_PREVIEW_CHARS:
+            preview = f"{preview[:INPUT_PREVIEW_CHARS]}… [{len(preview) - INPUT_PREVIEW_CHARS} more chars]"
+        now = time.time()
+        cur = self._exec(
+            "INSERT INTO audit_log (user_id, run_id, tool_use_id, tool, tier, input_preview, outcome, "
+            "requested_at, decided_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (user_id, run_id, tool_use_id, tool, tier, preview, outcome, now, None if outcome == "pending" else now),
+        )
+        return int(cur.lastrowid)
+
+    def audit_decide(self, audit_id: int, outcome: AuditOutcome, reason: str = "") -> None:
+        """Settle a pending request. A row that is already settled is left alone (first answer wins)."""
+        self._exec(
+            "UPDATE audit_log SET outcome=?, reason=?, decided_at=? WHERE id=? AND outcome='pending'",
+            (outcome, reason, time.time(), audit_id),
+        )
+
+    def audit_result(self, audit_id: int, result: str) -> None:
+        self._exec("UPDATE audit_log SET result=? WHERE id=?", (result, audit_id))
+
+    def fail_orphaned_approvals(self) -> int:
+        """At startup nothing can still be waiting for an answer, so close requests a crash left 'pending'."""
+        cur = self._exec(
+            "UPDATE audit_log SET outcome='cancelled', reason='server restarted while waiting', decided_at=? "
+            "WHERE outcome='pending'",
+            (time.time(),),
+        )
+        return cur.rowcount
+
+    def list_audit(
+        self,
+        user_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        outcome: str | None = None,
+        tool: str | None = None,
+        tier: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Newest first. `total` honours the filters; `counts` (per outcome) covers the user's whole log."""
+        where, params = ["a.user_id=?"], [user_id]
+        for column, value in (("outcome", outcome), ("tool", tool), ("tier", tier), ("run_id", run_id)):
+            if value is not None:
+                where.append(f"a.{column}=?")
+                params.append(value)
+        clause = " AND ".join(where)
+        row = self._one(f"SELECT COUNT(*) AS n FROM audit_log a WHERE {clause}", tuple(params))
+        total = int(row["n"]) if row else 0
+        items = self._all(
+            # the run's prompt is context only: once its chat is deleted it is gone, the audit row is not
+            "SELECT a.*, substr(r.user_text, 1, 200) AS run_text FROM audit_log a "
+            "LEFT JOIN runs r ON r.id=a.run_id AND r.user_id=a.user_id "
+            f"WHERE {clause} ORDER BY a.id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+        counts = {
+            r["outcome"]: r["n"]
+            for r in self._all(
+                "SELECT outcome, COUNT(*) AS n FROM audit_log WHERE user_id=? GROUP BY outcome", (user_id,)
+            )
+        }
+        return {"items": items, "total": total, "counts": counts}

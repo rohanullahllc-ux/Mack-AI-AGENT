@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { applyEvent, emptyRun, runFromRecord } from "../src/lib/runview.ts";
-import type { AgentEvent, RunRecord } from "../src/lib/types.ts";
+import type { AgentEvent, RunRecord, RunView, Step } from "../src/lib/types.ts";
 
 let seq = 0;
 const ev = (type: string, data: Record<string, unknown> = {}): AgentEvent => ({ seq: seq++, type, data });
@@ -114,4 +114,106 @@ test("history (no deltas) renders from stored events", () => {
   assert.deepEqual(view.steps, [{ kind: "text", text: "stored answer", live: false }]);
   assert.equal(view.status, "completed");
   assert.equal(view.costUsd, 0.002);
+});
+
+// ---- approvals ---------------------------------------------------------------
+
+const call = () => ev("tool_call", { id: "t1", name: "write_note", input: { title: "a" }, source: "client", tier: "write" });
+const request = () => ev("approval_request", { id: "t1", name: "write_note", tier: "write", timeout_s: 300 });
+const decision = (data: Record<string, unknown>, ts?: number): AgentEvent => ({
+  ...ev("approval_decision", { id: "t1", ...data }),
+  ts,
+});
+const toolStep = (run: RunView, i = 0) => {
+  const step = run.steps[i];
+  assert.equal(step.kind, "tool");
+  return step as Extract<Step, { kind: "tool" }>;
+};
+
+test("an approval request parks the tool call until it is answered", () => {
+  const step = toolStep(fold([call(), request()]));
+  assert.equal(step.status, "awaiting_approval");
+  assert.equal(step.approvalTimeoutS, 300);
+  assert.equal(step.approval, undefined);
+});
+
+test("approving resumes the tool, records how it was answered, and the result settles it", () => {
+  const answered = fold([call(), request(), decision({ approved: true, reason: "", outcome: "approved" }, 1_700_000_000)]);
+  assert.equal(toolStep(answered).status, "running");
+  assert.deepEqual(toolStep(answered).approval, { outcome: "approved", reason: "", ts: 1_700_000_000 });
+
+  const done = fold([
+    call(),
+    request(),
+    decision({ approved: true, outcome: "approved" }),
+    ev("tool_result", { id: "t1", output: "Saved", is_error: false }),
+  ]);
+  assert.equal(toolStep(done).status, "done");
+  assert.equal(toolStep(done).approval?.outcome, "approved");
+});
+
+test("a denial and a timeout are told apart, and neither runs the tool", () => {
+  const denied = fold([
+    call(),
+    request(),
+    decision({ approved: false, reason: "the user denied this action", outcome: "denied" }),
+    ev("tool_result", { id: "t1", output: "Not run (the user denied this action).", is_error: true, denied: true }),
+  ]);
+  assert.equal(toolStep(denied).status, "denied");
+  assert.deepEqual(toolStep(denied).approval, { outcome: "denied", reason: "the user denied this action", ts: undefined });
+
+  const timedOut = fold([
+    call(),
+    request(),
+    decision({ approved: false, reason: "no response within 300s", outcome: "timed_out" }),
+    ev("tool_result", { id: "t1", output: "Not run (no response within 300s).", is_error: true, denied: true }),
+  ]);
+  assert.equal(toolStep(timedOut).status, "denied");
+  assert.equal(toolStep(timedOut).approval?.outcome, "timed_out");
+});
+
+test("a cancelled request stays open until the run ends, then reads as never approved", () => {
+  const cancelled = decision({ approved: false, reason: "the run was cancelled", outcome: "cancelled" });
+  const mid = toolStep(fold([call(), request(), cancelled]));
+  assert.equal(mid.status, "awaiting_approval"); // no tool_result is coming; the end of the run settles it
+  assert.equal(mid.approval?.outcome, "cancelled");
+
+  const end = toolStep(fold([call(), request(), cancelled, ev("run_finished", { status: "cancelled", steps: 1 })]));
+  assert.equal(end.status, "error");
+  assert.equal(end.output, "(run ended before this was approved)");
+  assert.equal(end.approval?.outcome, "cancelled");
+});
+
+test("runs stored before decisions carried an outcome fall back to the yes/no", () => {
+  assert.equal(toolStep(fold([call(), request(), decision({ approved: true })])).approval?.outcome, "approved");
+  assert.equal(
+    toolStep(fold([call(), request(), decision({ approved: false, reason: "no response within 300s" })])).approval?.outcome,
+    "denied",
+  );
+});
+
+test("a decision for a call we have never seen changes nothing", () => {
+  const before = fold([call(), request()]);
+  const after = applyEvent(before, { ...decision({ approved: true, outcome: "approved" }), data: { id: "ghost", approved: true } });
+  assert.deepEqual(after.steps, before.steps);
+});
+
+test("replayed runs keep the time each approval was answered", () => {
+  const rec: RunRecord = {
+    id: "r7",
+    conversation_id: "c",
+    user_text: "q",
+    status: "completed",
+    model: "m",
+    steps: 1,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cost_usd: 0,
+    error: null,
+    started_at: 1,
+    finished_at: 2,
+    events: [call(), request(), decision({ approved: true, outcome: "approved" }, 1_700_000_123)],
+  };
+  assert.equal(toolStep(runFromRecord(rec)).approval?.ts, 1_700_000_123);
 });

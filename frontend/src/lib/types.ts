@@ -15,6 +15,8 @@ export interface AgentEvent {
   seq: number;
   type: string;
   data: Json;
+  /** When the server stored the event (epoch seconds). Only on replayed events, not on the live stream. */
+  ts?: number;
 }
 
 export interface Conversation {
@@ -65,7 +67,56 @@ export interface ToolInfo {
   source: "client" | "server";
 }
 
+// ---- audit log: who allowed what ------------------------------------------
+
+/** pending = waiting for an answer; auto = the approval policy let it run without asking. */
+export type AuditOutcome = "pending" | "auto" | "approved" | "denied" | "timed_out" | "cancelled";
+export type ToolTier = ToolInfo["tier"];
+
+export interface AuditEntry {
+  id: number;
+  run_id: string;
+  tool_use_id: string;
+  tool: string;
+  tier: ToolTier;
+  /** Compact JSON of the call's input, capped in length by the server. */
+  input_preview: string;
+  outcome: AuditOutcome;
+  reason: string;
+  /** Whether the tool then ran: null means it never did (denied, timed out, cancelled, still waiting). */
+  result: "ok" | "error" | "interrupted" | null;
+  requested_at: number;
+  decided_at: number | null;
+  /** The run's prompt, while its conversation still exists. */
+  run_text: string | null;
+}
+
+export interface AuditPage {
+  items: AuditEntry[];
+  /** Rows matching the filters (not just this page). */
+  total: number;
+  /** Rows per outcome across the whole log, whatever the filters. */
+  counts: Partial<Record<AuditOutcome, number>>;
+}
+
+export interface AuditQuery {
+  limit?: number;
+  offset?: number;
+  outcome?: AuditOutcome;
+  tool?: string;
+  tier?: ToolTier;
+  run_id?: string;
+}
+
 // ---- a run, folded from its events, ready to render ----------------------
+
+/** How an approval request ended, as recorded on the tool step it was about. */
+export interface ApprovalInfo {
+  outcome: "approved" | "denied" | "timed_out" | "cancelled";
+  reason: string;
+  /** When it was answered; only known for replayed runs. */
+  ts?: number;
+}
 
 export type Step =
   | { kind: "thinking"; text: string; live: boolean }
@@ -81,6 +132,7 @@ export type Step =
       output?: string;
       durationMs?: number;
       approvalTimeoutS?: number;
+      approval?: ApprovalInfo;
     }
   | { kind: "notice"; message: string }
   | { kind: "error"; message: string };

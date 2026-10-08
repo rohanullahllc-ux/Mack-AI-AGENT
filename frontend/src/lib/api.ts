@@ -1,6 +1,8 @@
 import type {
   AgentEvent,
   AppConfig,
+  AuditPage,
+  AuditQuery,
   Conversation,
   ConversationDetail,
   RunRecord,
@@ -74,6 +76,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ approved }),
     }),
+  audit: (query: AuditQuery = {}) => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
+    const qs = params.toString();
+    return request<AuditPage>(`/api/audit${qs ? `?${qs}` : ""}`);
+  },
 };
 
 /**

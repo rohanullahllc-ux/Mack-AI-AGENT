@@ -30,6 +30,11 @@ Emit = Callable[[str, dict[str, Any], bool], Awaitable[None]]
 class ApprovalDecision:
     approved: bool
     reason: str = ""  # why it was denied; shown to the model so it can explain or choose another way
+    timed_out: bool = False  # a denial because nobody answered in time, not because the user said no
+
+    @property
+    def outcome(self) -> str:
+        return "approved" if self.approved else "timed_out" if self.timed_out else "denied"
 
 
 # approve(tool_use_id, tool_name, tool_input, tier) -> the user's decision
@@ -272,25 +277,50 @@ class AgentRunner:
                     True,
                 )
 
-    def _needs_approval(self, tool: Tool, tool_input: Any) -> bool:
-        if _TIER_RANK[tool.tier] < _APPROVAL_THRESHOLD[self.settings.approval_level]:
-            return False
+    @staticmethod
+    def _is_well_formed(tool: Tool, tool_input: Any) -> bool:
         try:
             tool.input_model.model_validate(tool_input)
         except ValidationError:
-            return False  # malformed call: execute() reports the error to the model; nothing to approve
+            return False
         return True
+
+    def _needs_approval(self, tool: Tool, tool_input: Any) -> bool:
+        if _TIER_RANK[tool.tier] < _APPROVAL_THRESHOLD[self.settings.approval_level]:
+            return False
+        # a malformed call is not put to the user: execute() reports the error to the model
+        return self._is_well_formed(tool, tool_input)
 
     async def _run_tool(
         self, block: Any, ctx: ToolContext, emit: Emit, approve: Approver | None
     ) -> dict[str, Any]:
         tool = self.registry.get(block.name)
+        needs_approval = tool is not None and self._needs_approval(tool, block.input)
+        # every state-changing call that will really be considered is logged, whether or not we had to ask;
+        # reads and malformed calls change nothing, so they are not
+        audit_id: int | None = None
+        if tool is not None and tool.tier != "read" and self._is_well_formed(tool, block.input):
+            audit_id = self.db.audit_open(
+                user_id=ctx.user_id,
+                run_id=ctx.run_id,
+                tool_use_id=block.id,
+                tool=tool.name,
+                tier=tool.tier,
+                tool_input=block.input,
+                outcome="pending" if needs_approval else "auto",
+            )
+
         denied = False
-        if tool and self._needs_approval(tool, block.input):
+        if needs_approval:  # implies audit_id is set: only well-formed write/destructive calls get here
             if approve is None:
                 decision = ApprovalDecision(False, "no approval channel is available")
             else:
-                decision = await approve(block.id, tool.name, block.input, tool.tier)
+                try:
+                    decision = await approve(block.id, tool.name, block.input, tool.tier)
+                except asyncio.CancelledError:
+                    self.db.audit_decide(audit_id, "cancelled", "the run was cancelled while waiting")
+                    raise
+            self.db.audit_decide(audit_id, decision.outcome, decision.reason)
             denied = not decision.approved
         started = time.monotonic()
         if denied:
@@ -300,7 +330,16 @@ class AgentRunner:
                 True,
             )
         else:
-            result = await self.registry.execute(block.name, block.input, ctx)
+            try:
+                result = await self.registry.execute(block.name, block.input, ctx)
+            except asyncio.CancelledError:
+                # a sync tool keeps running in its worker thread after the await is cancelled, so whether it
+                # took effect is unknown
+                if audit_id is not None:
+                    self.db.audit_result(audit_id, "interrupted")
+                raise
+            if audit_id is not None:
+                self.db.audit_result(audit_id, "error" if result.is_error else "ok")
         await emit(
             "tool_result",
             {

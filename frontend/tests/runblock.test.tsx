@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { RunBlock } from "../src/components/RunBlock";
-import type { RunView, Step } from "../src/lib/types";
+import type { ApprovalInfo, RunView, Step } from "../src/lib/types";
 
 const run = (steps: Step[], over: Partial<RunView> = {}): RunView => ({
   key: "k",
@@ -59,6 +59,28 @@ describe("RunBlock approvals", () => {
   it("states the auto-deny timeout", () => {
     render(<RunBlock run={run([pending({ approvalTimeoutS: 300 })])} onDecide={vi.fn()} />);
     expect(screen.getByText(/Denied automatically after 5 min/)).toBeTruthy();
+  });
+});
+
+describe("RunBlock approval record", () => {
+  const settled = (approval?: ApprovalInfo): Step => pending({ status: "done", output: "Saved", approval });
+
+  it("says how an approval was answered", () => {
+    render(<RunBlock run={run([settled({ outcome: "approved", reason: "", ts: 1_700_000_000 })])} showUser={false} />);
+    expect(screen.getByText("Approval")).toBeTruthy();
+    expect(screen.getByText("Approved")).toBeTruthy();
+  });
+
+  it("explains a timeout with the reason", () => {
+    const approval: ApprovalInfo = { outcome: "timed_out", reason: "no response within 300s" };
+    render(<RunBlock run={run([settled(approval)])} showUser={false} />);
+    expect(screen.getByText("Timed out")).toBeTruthy();
+    expect(screen.getByText(/no response within 300s/)).toBeTruthy();
+  });
+
+  it("says nothing about approval for a call that never needed one", () => {
+    render(<RunBlock run={run([settled()])} showUser={false} />);
+    expect(screen.queryByText("Approval")).toBeNull();
   });
 });
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 
@@ -58,6 +59,13 @@ async def test_run_pauses_until_approved(settings):
     assert list(settings.data_dir.rglob("todo.md"))
     # approval events are durable, so a replay of this run shows who allowed what
     assert {"approval_request", "approval_decision"} <= {e["type"] for e in db.get_events(state.run_id)}
+    assert next(e for e in state.events if e["type"] == "approval_decision")["data"]["outcome"] == "approved"
+    (row,) = audit_rows(db)
+    assert (row["outcome"], row["result"], row["run_text"]) == ("approved", "ok", "save it")
+
+
+def audit_rows(db):
+    return db.list_audit(SINGLE_USER_ID)["items"]
 
 
 async def test_denied_action_is_not_performed(settings):
@@ -70,6 +78,9 @@ async def test_denied_action_is_not_performed(settings):
     result = next(e for e in state.events if e["type"] == "tool_result")["data"]
     assert result["denied"] is True
     assert db.get_run(state.run_id, SINGLE_USER_ID)["status"] == "completed"
+    assert next(e for e in state.events if e["type"] == "approval_decision")["data"]["outcome"] == "denied"
+    (row,) = audit_rows(db)
+    assert (row["outcome"], row["result"]) == ("denied", None)
 
 
 async def test_unanswered_approval_times_out_as_denied(settings):
@@ -79,8 +90,11 @@ async def test_unanswered_approval_times_out_as_denied(settings):
     await asyncio.wait_for(state.task, 5)
     decision = next(e for e in state.events if e["type"] == "approval_decision")["data"]
     assert decision["approved"] is False and "no response" in decision["reason"]
+    assert decision["outcome"] == "timed_out"  # told apart from the user saying no
     assert not list(settings.data_dir.rglob("*.md"))
     assert not state.approvals  # nothing left dangling
+    (row,) = audit_rows(db)
+    assert (row["outcome"], row["result"]) == ("timed_out", None)
 
 
 async def test_decide_rejects_unknown_and_repeat_decisions(settings):
@@ -104,6 +118,38 @@ async def test_cancelling_while_waiting_closes_the_run_cleanly(settings):
     assert run["status"] == "cancelled" and not state.approvals
     assert run["cost_usd"] > 0  # the model call before the pause was paid for and is recorded
     assert db.month_spend(SINGLE_USER_ID) == run["cost_usd"]
+
+
+async def test_cancelling_closes_the_approval_request_on_the_record(settings):
+    mgr, db, conv, _ = manager(settings, WRITE)
+    state = mgr.start(conversation_id=conv["id"], user_id=SINGLE_USER_ID, text="save it")
+    await wait_for_event(state, "approval_request")
+    assert mgr.cancel(state.run_id)
+    await asyncio.wait_for(state.task, 5)
+
+    stored = db.get_events(state.run_id)  # what a replay will show
+    types = [e["type"] for e in stored]
+    assert types.index("approval_request") < types.index("approval_decision") < types.index("run_finished")
+    decision = next(e for e in stored if e["type"] == "approval_decision")["data"]
+    assert decision["approved"] is False and decision["outcome"] == "cancelled"
+    assert "tool_result" not in types  # the action was never run
+    assert not list(settings.data_dir.rglob("*.md"))
+
+    (row,) = audit_rows(db)
+    assert (row["outcome"], row["result"]) == ("cancelled", None) and row["decided_at"] is not None
+
+
+async def test_audit_outlives_the_chat_it_came_from(settings):
+    mgr, db, conv, _ = manager(settings, WRITE)
+    state = mgr.start(conversation_id=conv["id"], user_id=SINGLE_USER_ID, text="save it")
+    await wait_for_event(state, "approval_request")
+    mgr.decide(state.run_id, "t1", True)
+    await asyncio.wait_for(state.task, 5)
+
+    assert db.delete_conversation(conv["id"], SINGLE_USER_ID)
+    assert db.get_events(state.run_id) == []  # the replay is gone...
+    (row,) = audit_rows(db)  # ...the record of what was allowed is not
+    assert (row["tool"], row["outcome"], row["result"], row["run_text"]) == ("write_note", "approved", "ok", None)
 
 
 async def test_failed_run_still_records_what_it_spent(settings):
@@ -198,3 +244,66 @@ def test_approval_round_trip_over_http(settings):
 def test_config_reports_approval_level(settings):
     with TestClient(create_app(settings, client=FakeClient([]))) as c:
         assert c.get("/api/config").json()["approval_level"] == "write"
+
+
+# ---- audit log over HTTP --------------------------------------------------------
+
+
+def run_write(c, auth=None) -> str:
+    """One whole exchange in a single request: only works when no approval click is needed."""
+    conv = c.post("/api/conversations", headers=auth).json()
+    r = c.post(f"/api/conversations/{conv['id']}/messages", json={"text": "save it"}, headers=auth)
+    return parse_run_id(r.text)
+
+
+def test_audit_endpoint_lists_filters_and_pages(settings):
+    settings.approval_level = "never"  # the write runs without a click
+    settings.app_token = "secret"
+    auth = {"Authorization": "Bearer secret"}
+    with TestClient(create_app(settings, client=FakeClient(WRITE))) as c:
+        assert c.get("/api/audit").status_code == 401
+        run_id = run_write(c, auth)
+
+        body = c.get("/api/audit", headers=auth).json()
+        assert body["total"] == 1 and body["counts"] == {"auto": 1}
+        (item,) = body["items"]
+        assert (item["run_id"], item["tool"], item["tier"], item["outcome"], item["result"]) == (
+            run_id, "write_note", "write", "auto", "ok",
+        )  # fmt: skip
+        assert json.loads(item["input_preview"]) == {"title": "Todo", "content": "milk"}
+        assert item["run_text"] == "save it"
+
+        def total(**query) -> int:
+            return c.get("/api/audit", params=query, headers=auth).json()["total"]
+
+        assert total(outcome="auto") == 1 and total(outcome="denied") == 0
+        assert total(tool="write_note") == 1 and total(tool="other_tool") == 0
+        assert total(tier="write") == 1 and total(tier="destructive") == 0
+        assert total(run_id=run_id) == 1 and total(run_id="nope") == 0
+
+        page = c.get("/api/audit", params={"limit": 1, "offset": 1}, headers=auth).json()
+        assert page["items"] == [] and page["total"] == 1
+
+        for bad in ({"outcome": "bogus"}, {"tier": "bogus"}, {"limit": 0}, {"limit": 201}, {"offset": -1}):
+            assert c.get("/api/audit", params=bad, headers=auth).status_code == 422, bad
+
+
+def test_replayed_events_carry_timestamps(settings):
+    settings.approval_level = "never"
+    with TestClient(create_app(settings, client=FakeClient(WRITE))) as c:
+        run_id = run_write(c)
+        events = c.get(f"/api/runs/{run_id}").json()["events"]
+        assert events and all(isinstance(e["ts"], float) for e in events)
+
+
+def test_a_restart_closes_requests_that_were_still_waiting(settings):
+    seed = Database(settings.db_path)
+    seed.audit_open(
+        user_id=SINGLE_USER_ID, run_id="r1", tool_use_id="t1", tool="write_note", tier="write",
+        tool_input={}, outcome="pending",
+    )  # fmt: skip
+    seed.close()  # the server "crashed" with this request unanswered
+
+    with TestClient(create_app(settings, client=FakeClient([]))) as c:
+        (item,) = c.get("/api/audit").json()["items"]
+        assert item["outcome"] == "cancelled" and "restarted" in item["reason"]

@@ -1,4 +1,4 @@
-import type { AgentEvent, RunRecord, RunView, Step } from "./types";
+import type { AgentEvent, ApprovalInfo, RunRecord, RunView, Step } from "./types";
 
 export function emptyRun(id: string, userText: string, key: string = id): RunView {
   return {
@@ -79,12 +79,22 @@ export function applyEvent(run: RunView, ev: AgentEvent): RunView {
         s.kind === "tool" && s.id === d.id ? { ...s, status: "awaiting_approval", approvalTimeoutS: d.timeout_s } : s,
       );
       break;
-    case "approval_decision":
-      // answered (or timed out): the tool runs next if approved; either way tool_result settles the step
-      steps = steps.map((s) =>
-        s.kind === "tool" && s.id === d.id && s.status === "awaiting_approval" ? { ...s, status: "running" } : s,
-      );
+    case "approval_decision": {
+      // `outcome` is missing on runs recorded before it existed: fall back to the yes/no
+      const approval: ApprovalInfo = {
+        outcome: d.outcome ?? (d.approved ? "approved" : "denied"),
+        reason: d.reason ?? "",
+        ts: ev.ts,
+      };
+      steps = steps.map((s): Step => {
+        if (s.kind !== "tool" || s.id !== d.id) return s;
+        // answered (or timed out): the tool runs next if approved; either way tool_result settles the step.
+        // A cancelled request has no result coming: the end of the run settles it.
+        const next = s.status === "awaiting_approval" && approval.outcome !== "cancelled";
+        return { ...s, approval, ...(next ? { status: "running" as const } : {}) };
+      });
       break;
+    }
     case "tool_result":
       steps = steps.map((s) =>
         s.kind === "tool" && s.id === d.id

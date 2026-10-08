@@ -101,13 +101,21 @@ class RunManager:
         try:
             decision = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
-            decision = ApprovalDecision(False, f"no response within {timeout:.0f}s")
+            decision = ApprovalDecision(False, f"no response within {timeout:.0f}s", timed_out=True)
+        except asyncio.CancelledError:
+            # close the request on the record, so a replay never shows one that nobody answered
+            await self._emit(
+                state,
+                "approval_decision",
+                {"id": tool_use_id, "approved": False, "reason": "the run was cancelled", "outcome": "cancelled"},
+            )
+            raise
         finally:
             state.approvals.pop(tool_use_id, None)
         await self._emit(
             state,
             "approval_decision",
-            {"id": tool_use_id, "approved": decision.approved, "reason": decision.reason},
+            {"id": tool_use_id, "approved": decision.approved, "reason": decision.reason, "outcome": decision.outcome},
         )
         return decision
 
