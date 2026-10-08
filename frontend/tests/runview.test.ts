@@ -1,0 +1,117 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { applyEvent, emptyRun, runFromRecord } from "../src/lib/runview.ts";
+import type { AgentEvent, RunRecord } from "../src/lib/types.ts";
+
+let seq = 0;
+const ev = (type: string, data: Record<string, unknown> = {}): AgentEvent => ({ seq: seq++, type, data });
+const fold = (events: AgentEvent[]) => events.reduce(applyEvent, emptyRun("pending", "hi"));
+
+test("live deltas build one step, final text event replaces it", () => {
+  const run = fold([
+    ev("run_started", { run_id: "r1" }),
+    ev("text_delta", { text: "Hel" }),
+    ev("text_delta", { text: "lo" }),
+  ]);
+  assert.equal(run.id, "r1");
+  assert.deepEqual(run.steps, [{ kind: "text", text: "Hello", live: true }]);
+
+  const done = applyEvent(run, ev("text", { text: "Hello!" }));
+  assert.deepEqual(done.steps, [{ kind: "text", text: "Hello!", live: false }]);
+});
+
+test("React key stays stable when the server assigns the real run id", () => {
+  const start = emptyRun("pending", "hi", "local-1");
+  const run = applyEvent(start, ev("run_started", { run_id: "r1" }));
+  assert.equal(run.id, "r1");
+  assert.equal(run.key, "local-1"); // a changing key would remount the block and collapse open panels
+});
+
+test("thinking + text stream in order and finalize against the right live step", () => {
+  const run = fold([
+    ev("thinking_delta", { text: "hm" }),
+    ev("text_delta", { text: "ans" }),
+    // end-of-message events arrive thinking-first, matching block order
+    ev("thinking", { text: "hmm full" }),
+    ev("text", { text: "answer" }),
+  ]);
+  assert.deepEqual(run.steps, [
+    { kind: "thinking", text: "hmm full", live: false },
+    { kind: "text", text: "answer", live: false },
+  ]);
+});
+
+test("tool call then result updates the same step", () => {
+  const run = fold([
+    ev("tool_call", { id: "t1", name: "write_note", input: { title: "a" }, source: "client", tier: "write" }),
+    ev("tool_result", { id: "t1", output: "Saved", is_error: false, duration_ms: 12 }),
+  ]);
+  const step = run.steps[0];
+  assert.equal(step.kind, "tool");
+  if (step.kind === "tool") {
+    assert.equal(step.status, "done");
+    assert.equal(step.output, "Saved");
+    assert.equal(step.durationMs, 12);
+  }
+});
+
+test("failed tool is marked error; unfinished tools are closed out on run_finished", () => {
+  const run = fold([
+    ev("tool_call", { id: "a", name: "x", input: {}, source: "client" }),
+    ev("tool_call", { id: "b", name: "y", input: {}, source: "client" }),
+    ev("tool_result", { id: "a", output: "boom", is_error: true }),
+    ev("run_finished", { status: "cancelled", cost_usd: 0.01, steps: 1 }),
+  ]);
+  const [a, b] = run.steps;
+  assert.equal(a.kind === "tool" && a.status, "error");
+  assert.equal(b.kind === "tool" && b.status, "error"); // never left spinning forever
+  assert.equal(run.status, "cancelled");
+});
+
+test("usage accumulates tokens and tracks cost", () => {
+  const run = fold([
+    ev("usage", { step: 1, input_tokens: 100, output_tokens: 10, run_cost_usd: 0.001 }),
+    ev("usage", { step: 2, input_tokens: 200, output_tokens: 20, run_cost_usd: 0.003 }),
+  ]);
+  assert.equal(run.inputTokens, 300);
+  assert.equal(run.outputTokens, 30);
+  assert.equal(run.costUsd, 0.003);
+  assert.equal(run.modelSteps, 2);
+});
+
+test("reset drops live steps but keeps finalized ones", () => {
+  const run = fold([
+    ev("tool_call", { id: "t", name: "x", input: {}, source: "client" }),
+    ev("text_delta", { text: "partial" }),
+    ev("reset"),
+  ]);
+  assert.equal(run.steps.length, 1);
+  assert.equal(run.steps[0].kind, "tool");
+});
+
+test("history (no deltas) renders from stored events", () => {
+  const rec: RunRecord = {
+    id: "r9",
+    conversation_id: "c",
+    user_text: "q",
+    status: "completed",
+    model: "m",
+    steps: 1,
+    input_tokens: 5,
+    output_tokens: 5,
+    cache_read_tokens: 0,
+    cost_usd: 0.002,
+    error: null,
+    started_at: 1,
+    finished_at: 2,
+    events: [
+      { seq: 0, type: "run_started", data: { run_id: "r9" } },
+      { seq: 2, type: "text", data: { text: "stored answer" } },
+      { seq: 3, type: "run_finished", data: { status: "completed", cost_usd: 0.002, steps: 1 } },
+    ],
+  };
+  const view = runFromRecord(rec);
+  assert.deepEqual(view.steps, [{ kind: "text", text: "stored answer", live: false }]);
+  assert.equal(view.status, "completed");
+  assert.equal(view.costUsd, 0.002);
+});
